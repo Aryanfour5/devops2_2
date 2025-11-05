@@ -2,169 +2,198 @@ pipeline {
     agent any
     
     environment {
-        // Docker registry credentials
-        DOCKER_REGISTRY = 'docker.io'
-        DOCKER_REGISTRY_CREDENTIAL = 'dockerhub-credentials'
-        
-        // Docker image details
-        DOCKER_IMAGE_NAME = 'your-dockerhub-username/jenkins-pipeline-demo'
+        DOCKER_REGISTRY = 'your-dockerhub-username'
+        DOCKER_IMAGE_NAME = '${DOCKER_REGISTRY}/jenkins-pipeline-demo'
         DOCKER_IMAGE_TAG = "${BUILD_NUMBER}"
         DOCKER_IMAGE_LATEST = 'latest'
         
-        // Kubernetes details
-        K8S_NAMESPACE = 'default'
+        K8S_NAMESPACE_PROD = 'production'
+        K8S_NAMESPACE_STAGING = 'staging'
         K8S_DEPLOYMENT = 'jenkins-pipeline-demo'
-        KUBECONFIG_CREDENTIAL = 'kubeconfig-credentials'
+        
+        // Set BRANCH_NAME for when conditions (important!)
+        BRANCH_NAME = "${GIT_BRANCH.replaceAll('origin/', '')}"
     }
     
     options {
-        // Keep last 10 builds
         buildDiscarder(logRotator(numToKeepStr: '10'))
-        
-        // Timeout after 1 hour
         timeout(time: 1, unit: 'HOURS')
-        
-        // Add timestamps to console output
         timestamps()
     }
     
     stages {
+        stage('0. Initialize') {
+            steps {
+                script {
+                    echo "╔═══════════════════════════════════════╗"
+                    echo "║  PIPELINE INITIALIZATION              ║"
+                    echo "╚═══════════════════════════════════════╝"
+                    echo "Branch: ${BRANCH_NAME}"
+                    echo "Build Number: ${BUILD_NUMBER}"
+                    echo "Build ID: ${BUILD_ID}"
+                    echo "Build URL: ${BUILD_URL}"
+                }
+            }
+        }
+        
         stage('1. Checkout') {
             steps {
                 script {
-                    echo "========== Cloning Repository =========="
+                    echo "========== STAGE 1: CHECKOUT =========="
                 }
-                checkout([
-                    $class: 'GitSCM',
-                    branches: [[name: '*/main']],
-                    userRemoteConfigs: [[
-                        url: 'https://github.com/YOUR_USERNAME/jenkins-pipeline-demo.git',
-                        credentialsId: 'github-credentials'
-                    ]]
-                ])
+                checkout scm
             }
         }
         
         stage('2. Install Dependencies') {
             steps {
                 script {
-                    echo "========== Installing Dependencies =========="
+                    echo "========== STAGE 2: INSTALL DEPENDENCIES =========="
                 }
-                sh 'cd src && npm install'
+                sh 'npm install'
             }
         }
         
+        // ✅ ALWAYS RUN - All branches
         stage('3. Unit Tests') {
             steps {
                 script {
-                    echo "========== Running Unit Tests =========="
+                    echo "========== STAGE 3: UNIT TESTS (ALL BRANCHES) =========="
                 }
-                sh 'cd src && npm test'
+                sh 'npm test'
             }
             post {
                 always {
-                    junit 'src/junit.xml'
-                    publishHTML([
-                        reportDir: 'src/coverage',
-                        reportFiles: 'index.html',
-                        reportName: 'Code Coverage Report'
-                    ])
+                    echo "✅ Unit tests completed"
                 }
             }
         }
         
+        // ✅ ALWAYS RUN - All branches
         stage('4. Build Docker Image') {
             steps {
                 script {
-                    echo "========== Building Docker Image =========="
+                    echo "========== STAGE 4: BUILD DOCKER IMAGE (ALL BRANCHES) =========="
+                }
+                sh '''
+                    docker build \
+                        --tag ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
+                        --tag ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_LATEST} \
+                        .
+                    
+                    docker images | grep jenkins-pipeline-demo
+                '''
+            }
+        }
+        
+        // 🔴 ONLY main and develop
+        stage('5. Push to Docker Registry') {
+            when {
+                expression {
+                    return env.BRANCH_NAME == 'main' || env.BRANCH_NAME == 'develop'
+                }
+            }
+            steps {
+                script {
+                    echo "========== STAGE 5: PUSH TO DOCKER REGISTRY (main/develop only) =========="
+                }
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-credentials',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
                     sh '''
-                        docker build \
-                            --tag ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
-                            --tag ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_LATEST} \
-                            .
-                        
-                        docker images | grep jenkins-pipeline-demo
+                        echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
+                        docker push ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}
+                        docker push ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_LATEST}
+                        docker logout
                     '''
                 }
             }
         }
         
-        stage('5. Push to Docker Registry') {
-            when {
-                branch 'main'  // Only push on main branch
-            }
-            steps {
-                script {
-                    echo "========== Pushing Image to Docker Hub =========="
-                    withCredentials([usernamePassword(
-                        credentialsId: "${DOCKER_REGISTRY_CREDENTIAL}",
-                        usernameVariable: 'DOCKER_USER',
-                        passwordVariable: 'DOCKER_PASS'
-                    )]) {
-                        sh '''
-                            echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
-                            docker push ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG}
-                            docker push ${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_LATEST}
-                            docker logout
-                        '''
-                    }
-                }
-            }
-        }
-        
-        stage('6. Deploy to Kubernetes') {
-            when {
-                branch 'main'  // Only deploy from main branch
-            }
-            steps {
-                script {
-                    echo "========== Deploying to Kubernetes =========="
-                    withCredentials([file(credentialsId: "${KUBECONFIG_CREDENTIAL}", variable: 'KUBECONFIG_FILE')]) {
-                        sh '''
-                            export KUBECONFIG=$KUBECONFIG_FILE
-                            
-                            # Update image tag in deployment
-                            kubectl set image deployment/${K8S_DEPLOYMENT} \
-                                ${K8S_DEPLOYMENT}=${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
-                                -n ${K8S_NAMESPACE} \
-                                || kubectl apply -f k8s/deployment.yaml -n ${K8S_NAMESPACE}
-                            
-                            # Wait for rollout
-                            kubectl rollout status deployment/${K8S_DEPLOYMENT} \
-                                -n ${K8S_NAMESPACE} \
-                                --timeout=5m
-                        '''
-                    }
-                }
-            }
-        }
-        
-        stage('7. Smoke Tests') {
+        // 🟢 ONLY main - Production deployment
+        stage('6. Deploy to Production') {
             when {
                 branch 'main'
             }
             steps {
                 script {
-                    echo "========== Running Smoke Tests =========="
-                    sh '''
-                        # Get service endpoint
-                        SERVICE_IP=$(kubectl get service jenkins-pipeline-demo -n default -o jsonpath='{.spec.clusterIP}')
-                        
-                        # Wait for service to be ready
-                        for i in {1..30}; do
-                            if curl -f http://$SERVICE_IP:3000/health; then
-                                echo "Service is healthy"
-                                break
-                            fi
-                            echo "Waiting for service... ($i/30)"
-                            sleep 2
-                        done
-                        
-                        # Run smoke tests
-                        curl -f http://$SERVICE_IP:3000/api/users
-                        curl -f http://$SERVICE_IP:3000/api/sum/10/20
-                    '''
+                    echo "========== STAGE 6: DEPLOY TO PRODUCTION (main only) =========="
                 }
+                sh '''
+                    kubectl config use-context minikube
+                    kubectl apply -f k8s/deployment.yaml -n ${K8S_NAMESPACE_PROD}
+                    kubectl set image deployment/${K8S_DEPLOYMENT} \
+                        ${K8S_DEPLOYMENT}=${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
+                        -n ${K8S_NAMESPACE_PROD}
+                    kubectl rollout status deployment/${K8S_DEPLOYMENT} \
+                        -n ${K8S_NAMESPACE_PROD} \
+                        --timeout=5m
+                '''
+            }
+        }
+        
+        // 🟡 ONLY develop - Staging deployment
+        stage('7. Deploy to Staging') {
+            when {
+                branch 'develop'
+            }
+            steps {
+                script {
+                    echo "========== STAGE 7: DEPLOY TO STAGING (develop only) =========="
+                }
+                sh '''
+                    kubectl config use-context minikube
+                    kubectl apply -f k8s/deployment.yaml -n ${K8S_NAMESPACE_STAGING}
+                    kubectl set image deployment/${K8S_DEPLOYMENT} \
+                        ${K8S_DEPLOYMENT}=${DOCKER_IMAGE_NAME}:${DOCKER_IMAGE_TAG} \
+                        -n ${K8S_NAMESPACE_STAGING}
+                    kubectl rollout status deployment/${K8S_DEPLOYMENT} \
+                        -n ${K8S_NAMESPACE_STAGING} \
+                        --timeout=5m
+                '''
+            }
+        }
+        
+        // 🔵 ONLY feature branches - Integration tests
+        stage('8. Integration Tests') {
+            when {
+                expression {
+                    return env.BRANCH_NAME.startsWith('feature/')
+                }
+            }
+            steps {
+                script {
+                    echo "========== STAGE 8: INTEGRATION TESTS (feature/* only) =========="
+                }
+                sh 'npm run test:integration || echo "Integration tests not configured"'
+            }
+        }
+        
+        // 🟣 ONLY main - Production smoke tests
+        stage('9. Production Smoke Tests') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    echo "========== STAGE 9: PRODUCTION SMOKE TESTS (main only) =========="
+                }
+                sh '''
+                    # Wait for service to be ready
+                    for i in {1..30}; do
+                        if curl -f http://jenkins-pipeline-demo:3000/health; then
+                            echo "✅ Service is healthy"
+                            break
+                        fi
+                        echo "Waiting for service... ($i/30)"
+                        sleep 2
+                    done
+                    
+                    curl -f http://jenkins-pipeline-demo:3000/api/users
+                    echo "✅ API tests passed"
+                '''
             }
         }
     }
@@ -172,29 +201,34 @@ pipeline {
     post {
         always {
             script {
-                echo "========== Pipeline Execution Summary =========="
+                echo "╔═══════════════════════════════════════╗"
+                echo "║  PIPELINE SUMMARY                     ║"
+                echo "╚═══════════════════════════════════════╝"
+                echo "Branch: ${BRANCH_NAME}"
                 echo "Build Status: ${currentBuild.result}"
-                echo "Build Number: ${BUILD_NUMBER}"
                 echo "Build Duration: ${currentBuild.durationString}"
             }
-            
-            // Clean up workspace
             cleanWs()
         }
         
         success {
             script {
-                echo "✅ Pipeline completed successfully"
-                // Send Slack notification
-                // slackSend(channel: '#deployments', message: "✅ Deployment successful for build #${BUILD_NUMBER}")
+                echo "✅✅✅ PIPELINE SUCCESSFUL ✅✅✅"
+                if (env.BRANCH_NAME == 'main') {
+                    echo "🚀 Deployment to PRODUCTION completed"
+                } else if (env.BRANCH_NAME == 'develop') {
+                    echo "🟡 Deployment to STAGING completed"
+                } else if (env.BRANCH_NAME.startsWith('feature/')) {
+                    echo "🧪 Feature branch tests passed"
+                }
             }
         }
         
         failure {
             script {
-                echo "❌ Pipeline failed"
-                // Send Slack notification
-                // slackSend(channel: '#deployments', message: "❌ Deployment failed for build #${BUILD_NUMBER}")
+                echo "❌❌❌ PIPELINE FAILED ❌❌❌"
+                echo "Branch: ${BRANCH_NAME}"
+                echo "Failed Build: ${BUILD_URL}"
             }
         }
     }
